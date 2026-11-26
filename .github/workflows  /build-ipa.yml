@@ -1,0 +1,252 @@
+# CoverS → .ipa (без подписи). Собирается на macOS-раннере GitHub.
+#
+# Как пользоваться
+#   1. Этот файл должен лежать в репозитории по пути  .github/workflows/build-ipa.yml
+#   2. Загрузи CoverS-system.zip в корень репозитория — сборка запустится сама.
+#      (или: вкладка Actions → "Build CoverS IPA" → Run workflow)
+#   3. Готовый CoverS.ipa:  Releases → "CoverS IPA"  (прямая ссылка на файл)
+#      или: Actions → нужный запуск → Artifacts.
+#
+# Воркфлоу сам находит zip с проектом (берёт самый свежий), распаковывает, собирает
+# и, если проект «как есть» не собрался, пересоздаёт его из project.yml через XcodeGen.
+
+name: Build CoverS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Путь к zip с проектом (пусто = найти автоматически)"
+        required: false
+        default: ""
+      xcode:
+        description: "Версия Xcode, например 26.6 (пусто = по умолчанию на раннере)"
+        required: false
+        default: ""
+  push:
+    paths:
+      - "**.zip"
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: CoverS
+  MIN_IOS: "15.0"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find and unpack the project zip
+        shell: bash
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/src"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+
+          ZIP="${INPUT_ZIP:-}"
+          if [ -n "$ZIP" ] && [ ! -f "$ZIP" ]; then
+            echo "::error::Файл '$ZIP' не найден в репозитории"; exit 1
+          fi
+
+          # Без явного пути: берём самый свежий (по коммиту) zip, внутри которого есть .xcodeproj
+          if [ -z "$ZIP" ]; then
+            BEST_T=0
+            while IFS= read -r z; do
+              LIST="$(unzip -Z1 "$z" 2>/dev/null || true)"
+              case "$LIST" in
+                *'.xcodeproj/project.pbxproj'*)
+                  T="$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)"
+                  if [ -z "$T" ]; then T=0; fi
+                  if [ -z "$ZIP" ] || [ "$T" -ge "$BEST_T" ]; then ZIP="$z"; BEST_T="$T"; fi
+                  ;;
+              esac
+            done < <(find . -type f -iname '*.zip' -not -path './.git/*' | sort)
+          fi
+
+          if [ -n "$ZIP" ]; then
+            echo "Распаковываю: $ZIP"
+            unzip -q -o "$ZIP" -d "$WORK" -x '__MACOSX/*' '*/.DS_Store' || true
+            ROOT="$WORK"
+          else
+            echo "Zip с проектом не найден — ищу проект прямо в репозитории"
+            ROOT="$GITHUB_WORKSPACE"
+          fi
+
+          XCPROJ="$(find "$ROOT" -maxdepth 4 -type d -name '*.xcodeproj' -not -path '*/__MACOSX/*' -not -path '*/.git/*' | sort | sed -n '1p')"
+          if [ -z "$XCPROJ" ]; then
+            echo "::error::Не нашёл *.xcodeproj. Загрузи CoverS-system.zip в корень репозитория."
+            if [ -n "$ZIP" ]; then unzip -l "$ZIP" | sed -n '1,60p'; fi
+            exit 1
+          fi
+          PROJ_DIR="$(dirname "$XCPROJ")"
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+          echo "XCPROJ=$XCPROJ" >> "$GITHUB_ENV"
+          echo "Проект: $XCPROJ"
+          ls -la "$PROJ_DIR"
+
+      - name: Select Xcode and show toolchain
+        shell: bash
+        env:
+          XCODE_VER: ${{ github.event.inputs.xcode }}
+        run: |
+          set -uo pipefail
+          if [ -n "${XCODE_VER:-}" ]; then
+            if [ -d "/Applications/Xcode_${XCODE_VER}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${XCODE_VER}.app/Contents/Developer"
+            else
+              echo "::warning::Xcode_${XCODE_VER}.app не найден, остаюсь на версии по умолчанию"
+              ls /Applications | grep -i '^Xcode' || true
+            fi
+          fi
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: Build (unsigned, iOS ${{ env.MIN_IOS }}+)
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$PROJ_DIR"
+
+          build() {   # $1 = путь к .xcodeproj, $2 = scheme, $3 = лог
+            xcodebuild \
+              -project "$1" \
+              -scheme "$2" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$RUNNER_TEMP/dd" \
+              IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+              ONLY_ACTIVE_ARCH=NO \
+              clean build 2>&1 | tee "$3"
+          }
+
+          SCHEME="$(xcodebuild -list -project "$XCPROJ" 2>/dev/null | awk '/Schemes:/{f=1;next} f&&NF{gsub(/^[ \t]+/,"");print;exit}')"
+          [ -z "$SCHEME" ] && SCHEME="$APP_NAME"
+          echo "Scheme: $SCHEME"
+
+          if build "$XCPROJ" "$SCHEME" "$RUNNER_TEMP/build-1.log"; then
+            echo "Сборка проекта «как есть» прошла."
+          else
+            echo "::warning::Сборка проекта как есть не удалась — пересоздаю проект через XcodeGen и пробую снова"
+            if [ ! -f project.yml ]; then
+              echo "::error::project.yml не найден, запасной вариант недоступен"; exit 1
+            fi
+            brew install xcodegen
+            rm -rf "$RUNNER_TEMP/dd"
+            xcodegen generate --spec project.yml
+            build "$PROJ_DIR/$APP_NAME.xcodeproj" "$APP_NAME" "$RUNNER_TEMP/build-2.log" || exit 1
+          fi
+
+      - name: Pack .ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find "$RUNNER_TEMP/dd/Build/Products" -maxdepth 2 -type d -name '*.app' | sed -n '1p')"
+          if [ -z "$APP" ]; then echo "::error::Сборка прошла, но .app не найден"; exit 1; fi
+          echo "APP=$APP"
+
+          python3 - "$APP" <<'PY'
+          import os, plistlib, sys
+          app = sys.argv[1]
+          with open(os.path.join(app, "Info.plist"), "rb") as f:
+              info = plistlib.load(f)
+          exe = info.get("CFBundleExecutable")
+          print("Bundle id :", info.get("CFBundleIdentifier"))
+          print("Executable:", exe)
+          print("Min iOS   :", info.get("MinimumOSVersion"))
+          assert exe and os.path.isfile(os.path.join(app, exe)), "нет исполняемого файла в .app"
+          assert os.path.isfile(os.path.join(app, "www", "index.html")), "папка www не попала в .app"
+          assert info.get("UILaunchScreen") is not None, "в Info.plist нет UILaunchScreen"
+          assert info.get("UIApplicationSceneManifest") is not None, "в Info.plist нет UIApplicationSceneManifest"
+          PY
+
+          OUT="$GITHUB_WORKSPACE/out"
+          rm -rf "$OUT"; mkdir -p "$OUT/Payload"
+          cp -R "$APP" "$OUT/Payload/"
+          ( cd "$OUT" && zip -qry "$APP_NAME.ipa" Payload )
+          ls -la "$OUT"
+          unzip -l "$OUT/$APP_NAME.ipa" | sed -n '1,25p'
+          echo "IPA=$OUT/$APP_NAME.ipa" >> "$GITHUB_ENV"
+
+          SIZE="$(du -h "$OUT/$APP_NAME.ipa" | cut -f1)"
+          {
+            echo "### ✅ $APP_NAME.ipa готов ($SIZE)"
+            echo ""
+            echo "Скачать: **Releases → ipa-latest** или **Artifacts** этого запуска."
+            echo "IPA не подписан — подпиши любым сайдлоад-инструментом (Sideloadly, AltStore, ESign и т.п.)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: CoverS-ipa
+          path: out/CoverS.ipa
+          if-no-files-found: error
+
+      - name: Publish release (direct download link)
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          TAG="ipa-latest"
+          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$TAG" "$IPA" \
+            --title "CoverS IPA (сборка №${RUN_NUMBER})" \
+            --notes "Собрано GitHub Actions. IPA не подписан — подпиши через Sideloadly / AltStore / ESign и т.п." \
+            --target "$GITHUB_SHA"
+          echo "Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### ❌ Сборка не удалась"
+            echo ""
+            echo "Последние ошибки (скопируй и пришли, если нужна помощь):"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in "$RUNNER_TEMP"/build-*.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f: errors ====="
+            grep -E "error:|BUILD FAILED|fatal error" "$f" | head -n 30 | tee -a "$GITHUB_STEP_SUMMARY" || true
+            echo "===== $f: tail ====="
+            tail -n 40 "$f"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        continue-on-error: true
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/build-*.log
+          if-no-files-found: ignore
