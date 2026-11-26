@@ -1,5 +1,4 @@
 # Voilo
-# Voilo
 
 **A modern music player for iOS with a Material You-inspired design.**
 
